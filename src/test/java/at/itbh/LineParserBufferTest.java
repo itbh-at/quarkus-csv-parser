@@ -1,8 +1,6 @@
 package at.itbh;
 
 import java.nio.charset.Charset;
-import java.util.Arrays;
-import java.util.LinkedList;
 import javax.inject.Inject;
 import org.junit.jupiter.api.Test;
 import io.quarkus.test.junit.QuarkusTest;

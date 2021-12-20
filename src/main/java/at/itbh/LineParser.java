@@ -1,9 +1,13 @@
 package at.itbh;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.nio.charset.Charset;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 import io.smallrye.mutiny.Multi;
+import io.smallrye.mutiny.subscription.MultiEmitter;
 import io.vertx.core.file.OpenOptions;
 import io.vertx.mutiny.core.Vertx;
 import io.vertx.mutiny.core.buffer.Buffer;
@@ -23,10 +27,18 @@ public class LineParser {
 
     private final Vertx vertx;
     private final Charset encoding;
+    private final Optional<Integer> readBufferSize;
 
     public LineParser(Vertx vertx, Charset encoding) {
         this.vertx = vertx;
         this.encoding = encoding;
+        this.readBufferSize = Optional.empty();
+    }
+
+    public LineParser(Vertx vertx, Charset encoding, int readBufferSize) {
+        this.vertx = vertx;
+        this.encoding = encoding;
+        this.readBufferSize = Optional.of(readBufferSize);
     }
 
     public Multi<String> parse(String data) {
@@ -38,12 +50,78 @@ public class LineParser {
         return parse(Multi.createFrom().item(data));
     }
 
-    public Multi<String> parse(File file) {
+    public Multi<String> parse(File file) throws FileNotFoundException {
+        if (!file.exists()) {
+            throw new FileNotFoundException(file.getPath());
+        }
         var path = file.getPath();
-        var fileHandle = vertx.fileSystem().open(path, new OpenOptions().setRead(true));
-        var fileContents = fileHandle.onItem().transformToMulti(asyncFile -> asyncFile.toMulti());
+        var fileHandle =
+                vertx.fileSystem().open(path, new OpenOptions().setRead(true).setCreate(false));
+        var fileContents = fileHandle.onItem().transformToMulti(asyncFile -> {
+            if (readBufferSize.isPresent()) {
+                asyncFile.setReadBufferSize(readBufferSize.get());
+            }
+            return asyncFile.toMulti();
+        });
         return parse(fileContents);
     }
+
+    /**
+     * Emits the line as {@link String} if not empty
+     * 
+     * @param emitter the {@link MultiEmitter} to use
+     * @param line the line's contents to be emitted as {@link String}
+     */
+    void emitLine(MultiEmitter<? super String> emitter, StringBuilder line) {
+        if (line.length() > 0) {
+            emitter.emit(line.toString());
+            line.setLength(0);
+        }
+    }
+
+    public Multi<String> parse(Multi<Buffer> buffers) {
+        return parseWithString(buffers);
+        // return parseCharByChar(buffers);
+    }
+
+    /**
+     * Parses the data in the buffers char by char to lines
+     * 
+     * <p>
+     * Attention, this performs very badly but uses a lot of {@link Stream} and {@link Multi} :-)
+     * </p>
+     * 
+     * @param buffers a sequence of bytes which can can be interpreted as a text by the specified
+     *        character encoding
+     * @return the lines
+     */
+    Multi<String> parseCharByChar(Multi<Buffer> buffers) {
+        final StringBuilder tempLine = new StringBuilder();
+
+        // emit line by line
+        return Multi.createFrom().emitter(emitter -> {
+            buffers
+                    // output the last line
+                    .onCompletion().invoke(() -> {
+                        emitLine(emitter, tempLine);
+                        emitter.complete();
+                    })
+                    // read all buffers and build lines
+                    .subscribe().with(buffer -> {
+                        String content = buffer.toString(encoding);
+                        Multi.createFrom()
+                                .items(content.codePoints().mapToObj(c -> String.valueOf((char) c)))
+                                .subscribe().with(c -> {
+                                    if (c.equals("\n") || c.equals("\r")) {
+                                        emitLine(emitter, tempLine);
+                                    } else {
+                                        tempLine.append(c);
+                                    }
+                                });
+                    });
+        });
+    }
+
 
     /**
      * Parses the data in the buffers to lines
@@ -52,7 +130,7 @@ public class LineParser {
      *        character encoding
      * @return the lines
      */
-    public Multi<String> parse(Multi<Buffer> buffers) {
+    Multi<String> parseWithString(Multi<Buffer> buffers) {
         final StringBuilder tempLine = new StringBuilder();
 
         // emit line by line
@@ -60,34 +138,21 @@ public class LineParser {
             buffers
                     // output the last line
                     .onCompletion().invoke(() -> {
-                        if (tempLine.length() > 0) {
-                            emitter.emit(tempLine.toString());
-                        }
+                        emitLine(emitter, tempLine);
                         emitter.complete();
                     })
                     // read all buffers and build lines
                     .subscribe().with(buffer -> {
                         String content = buffer.toString(encoding);
-                        if (content.contains("\n")) {
-                            // When content contains at least one line break, it is split at the
-                            // line breaks. The first line is appended to the current tempLine. All
-                            // other lines are treated as a full line except the last one. Empty
-                            // lines are discarded.
-                            Stream<String> linesInContent = content.lines();
-                            Multi.createFrom().items(linesInContent).subscribe().with(line -> {
-                                // handle line only if not empty
-                                if (line.length() > 0) {
-                                    tempLine.append(line);
-                                    // output the new full line
-                                    emitter.emit(tempLine.toString());
-                                }
-                                // prepare for new line
-                                tempLine.setLength(0);
-                            });
-                        } else {
-                            // When no line break is found the existing temporary line is continued.
-                            tempLine.append(content);
-                        }
+                        content = content.replace("\r", "");
+                        long newLineCount = content.chars().filter(c -> c == '\n').count();
+                        AtomicLong newLineCounter = new AtomicLong(0);
+                        Multi.createFrom().items(content.lines()).subscribe().with(line -> {
+                            tempLine.append(line);
+                            if (newLineCounter.incrementAndGet() <= newLineCount) {
+                                emitLine(emitter, tempLine);
+                            }
+                        });
                     });
         });
     }
