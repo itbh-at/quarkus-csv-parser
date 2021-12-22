@@ -2,10 +2,11 @@ package at.itbh;
 
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Stream;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.subscription.MultiEmitter;
 import io.vertx.core.file.OpenOptions;
@@ -25,9 +26,24 @@ import io.vertx.mutiny.core.buffer.Buffer;
  */
 public class LineParser {
 
+    public static enum Mode {
+        /**
+         * Uses {@link Files#lines(java.nio.file.Path)} for reading lines of the file
+         */
+        NIO,
+
+        /**
+         * Uses vert.x {@link io.vertx.mutiny.core.file.AsyncFile} for reading the file and custom
+         * splitting logic for line separation
+         */
+        ASYNC_FILE
+    }
+
     private final Vertx vertx;
     private final Charset encoding;
     private final Optional<Integer> readBufferSize;
+
+    private Mode mode = Mode.ASYNC_FILE;
 
     public LineParser(Vertx vertx, Charset encoding) {
         this.vertx = vertx;
@@ -41,6 +57,14 @@ public class LineParser {
         this.readBufferSize = Optional.of(readBufferSize);
     }
 
+    public Mode getMode() {
+        return mode;
+    }
+
+    public void setMode(Mode mode) {
+        this.mode = mode;
+    }
+
     public Multi<String> parse(String data) {
         Buffer buffer = Buffer.buffer().appendString(data, encoding.name());
         return parse(buffer);
@@ -50,10 +74,18 @@ public class LineParser {
         return parse(Multi.createFrom().item(data));
     }
 
-    public Multi<String> parse(File file) throws FileNotFoundException {
+    public Multi<String> parse(File file) throws IOException {
         if (!file.exists()) {
             throw new FileNotFoundException(file.getPath());
         }
+        if (getMode() == Mode.ASYNC_FILE) {
+            return parseFileWithVertxAsyncFile(file);
+        } else {
+            return parseFileWithNio(file);
+        }
+    }
+
+    private Multi<String> parseFileWithVertxAsyncFile(File file) {
         var path = file.getPath();
         var fileHandle =
                 vertx.fileSystem().open(path, new OpenOptions().setRead(true).setCreate(false));
@@ -64,6 +96,18 @@ public class LineParser {
             return asyncFile.toMulti();
         });
         return parse(fileContents);
+    }
+
+    private Multi<String> parseFileWithNio(File file) throws IOException {
+        var lines = Files.lines(Paths.get(file.getPath()), encoding);
+        return Multi.createFrom().emitter(emitter -> {
+            Multi.createFrom().items(lines).onCompletion().invoke(emitter::complete).subscribe()
+                    .with(line -> {
+                        if (line.length() > 0) {
+                            emitter.emit(line);
+                        }
+                    });
+        });
     }
 
     /**
@@ -81,47 +125,7 @@ public class LineParser {
 
     public Multi<String> parse(Multi<Buffer> buffers) {
         return parseWithString(buffers);
-        // return parseCharByChar(buffers);
     }
-
-    /**
-     * Parses the data in the buffers char by char to lines
-     * 
-     * <p>
-     * Attention, this performs very badly but uses a lot of {@link Stream} and {@link Multi} :-)
-     * </p>
-     * 
-     * @param buffers a sequence of bytes which can can be interpreted as a text by the specified
-     *        character encoding
-     * @return the lines
-     */
-    Multi<String> parseCharByChar(Multi<Buffer> buffers) {
-        final StringBuilder tempLine = new StringBuilder();
-
-        // emit line by line
-        return Multi.createFrom().emitter(emitter -> {
-            buffers
-                    // output the last line
-                    .onCompletion().invoke(() -> {
-                        emitLine(emitter, tempLine);
-                        emitter.complete();
-                    })
-                    // read all buffers and build lines
-                    .subscribe().with(buffer -> {
-                        String content = buffer.toString(encoding);
-                        Multi.createFrom()
-                                .items(content.codePoints().mapToObj(c -> String.valueOf((char) c)))
-                                .subscribe().with(c -> {
-                                    if (c.equals("\n") || c.equals("\r")) {
-                                        emitLine(emitter, tempLine);
-                                    } else {
-                                        tempLine.append(c);
-                                    }
-                                });
-                    });
-        });
-    }
-
 
     /**
      * Parses the data in the buffers to lines
@@ -144,12 +148,11 @@ public class LineParser {
                     // read all buffers and build lines
                     .subscribe().with(buffer -> {
                         String content = buffer.toString(encoding);
-                        content = content.replace("\r", "");
-                        long newLineCount = content.chars().filter(c -> c == '\n').count();
-                        AtomicLong newLineCounter = new AtomicLong(0);
+                        long newLineCount = content.length() - content.replace("\n", "").length();
+                        final long[] newLineCounter = {0};
                         Multi.createFrom().items(content.lines()).subscribe().with(line -> {
                             tempLine.append(line);
-                            if (newLineCounter.incrementAndGet() <= newLineCount) {
+                            if (++newLineCounter[0] <= newLineCount) {
                                 emitLine(emitter, tempLine);
                             }
                         });
