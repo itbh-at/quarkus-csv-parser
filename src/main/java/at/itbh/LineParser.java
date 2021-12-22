@@ -7,6 +7,7 @@ import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Optional;
+import java.util.stream.Stream;
 import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.subscription.MultiEmitter;
 import io.vertx.core.file.OpenOptions;
@@ -125,7 +126,47 @@ public class LineParser {
 
     public Multi<String> parse(Multi<Buffer> buffers) {
         return parseWithString(buffers);
+        // return parseCharByChar(buffers);
     }
+
+    /**
+     * Parses the data in the buffers char by char to lines
+     * 
+     * <p>
+     * Attention, this performs very badly but uses a lot of {@link Stream} and {@link Multi} :-)
+     * </p>
+     * 
+     * @param buffers a sequence of bytes which can can be interpreted as a text by the specified
+     *        character encoding
+     * @return the lines
+     */
+    Multi<String> parseCharByChar(Multi<Buffer> buffers) {
+        final StringBuilder tempLine = new StringBuilder();
+
+        // emit line by line
+        return Multi.createFrom().emitter(emitter -> {
+            buffers
+                    // output the last line
+                    .onCompletion().invoke(() -> {
+                        emitLine(emitter, tempLine);
+                        emitter.complete();
+                    })
+                    // read all buffers and build lines
+                    .subscribe().with(buffer -> {
+                        String content = buffer.toString(encoding);
+                        Multi.createFrom()
+                                .items(content.codePoints().mapToObj(c -> String.valueOf((char) c)))
+                                .subscribe().with(c -> {
+                                    if (c.equals("\n") || c.equals("\r")) {
+                                        emitLine(emitter, tempLine);
+                                    } else {
+                                        tempLine.append(c);
+                                    }
+                                });
+                    });
+        });
+    }
+
 
     /**
      * Parses the data in the buffers to lines
