@@ -19,3 +19,9 @@ quarkus dev
 ```
 
 > **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at http://localhost:8080/q/dev/.
+
+### Sources of sample files
+
+| name          | source                                                                        | page                                                                                  |
+| ------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| sales_records.csv | <https://eforexcel.com/wp/wp-content/uploads/2017/07/50000-Sales-Records.zip> | <https://eforexcel.com/wp/downloads-18-sample-csv-files-data-sets-for-testing-sales/> |
